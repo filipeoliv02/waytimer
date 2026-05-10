@@ -4,18 +4,9 @@ A simple activity timer with fuzzel menu integration and waybar support.
 
 ## Installation
 
-Install from AUR:
+Build locally:
 
 ```bash
-paru -S waytimer
-```
-
-Or build locally:
-
-```bash
-# Create the source tarball
-tar -czf waytimer-1.0.0.tar.gz waytimer.py waybar-config.jsonc waybar-style.css README.md LICENSE
-# Build and install the package
 makepkg -si
 ```
 
