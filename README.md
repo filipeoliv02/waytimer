@@ -4,7 +4,7 @@ A simple activity timer with fuzzel menu integration and waybar support.
 
 ## Installation
 
-Install from AUR (recommended):
+Install from AUR:
 
 ```bash
 paru -S waytimer
@@ -13,15 +13,17 @@ paru -S waytimer
 Or build locally:
 
 ```bash
+# Create the source tarball
+tar -czf waytimer-1.0.0.tar.gz waytimer.py waybar-config.jsonc waybar-style.css README.md LICENSE
+# Build and install the package
 makepkg -si
 ```
 
 ## Waybar Integration
 
-1. Append the timer module to your waybar config.
+1. Add the waytimer module to your waybar-config.jsonc.
 2. Add the CSS to your waybar style.css.
-3. Example waybar config: add `"custom/waytimer"` to modules-right or modules-center.
-
+3. Example waybar config: add `"custom/waytimer"`.
 4. Set a keybinding in your window manager to run `waytimer`
 
 ## Usage
