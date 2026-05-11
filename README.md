@@ -4,6 +4,12 @@ A simple activity timer with fuzzel menu integration and waybar support.
 
 ## Installation
 
+Install from AUR:
+
+```bash
+paru -S waytimer
+```
+
 Build locally:
 
 ```bash
