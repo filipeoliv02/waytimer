@@ -1,0 +1,10 @@
+*.pkg.tar.zst
+*.pkg.tar.zst.sig
+*.pkg.tar.xz
+*.pkg.tar
+src/
+pkg/
+*.tar.gz
+*.tar.zst
+__pycache__/
+*.pyc

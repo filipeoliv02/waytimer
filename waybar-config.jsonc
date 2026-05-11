@@ -1,0 +1,11 @@
+{
+  "custom/waytimer": {
+    "exec": "waytimer waybar",
+    "return-type": "json",
+    "interval": 1,
+    "on-click": "waytimer waybar-click 1",
+    "on-click-middle": "waytimer waybar-click 2",
+    "tooltip": true,
+    "format": "{}"
+  }
+}

@@ -1,0 +1,7 @@
+#custom-waytimer.running {
+    color: #00ff00;
+}
+
+#custom-waytimer.paused {
+    color: #ffaa00;
+}
