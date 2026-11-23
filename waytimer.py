@@ -5,11 +5,20 @@ Tracks time spent on different activities.
 """
 
 import json
+import os
 import subprocess
 import sys
+import tempfile
+import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+try:
+    import fcntl
+except ImportError:  # e.g. platforms without POSIX file locking
+    fcntl = None
 
 DATA_DIR = Path.home() / ".local" / "share" / "waytimer"
 DATA_FILE = DATA_DIR / "activities.json"
@@ -18,9 +27,11 @@ DATA_FILE = DATA_DIR / "activities.json"
 class ActivityTimer:
     """Manages activity timing and persistence."""
 
-    def __init__(self):
-        self.data_dir = DATA_DIR
-        self.data_file = DATA_FILE
+    def __init__(self, data_dir: Optional[Path] = None):
+        self.data_dir = Path(data_dir) if data_dir is not None else DATA_DIR
+        self.data_file = self.data_dir / "activities.json"
+        self._thread_lock = threading.RLock()
+        self._lock_depth = 0
         self.ensure_data_dir()
         self.current_activity = self._load_current()
         self.activities = self._load_activities()
@@ -29,46 +40,114 @@ class ActivityTimer:
         """Create data directory if it doesn't exist."""
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
-    def _load_current(self) -> Optional[dict]:
-        """Load the currently running timer."""
-        current_file = self.data_dir / "current.json"
-        if current_file.exists():
+    def _backup_corrupt_json(self, path: Path):
+        """Rename a corrupt JSON file without losing its contents."""
+        if not path.exists():
+            return
+        timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+        backup = path.with_name(f"{path.name}.corrupt-{timestamp}-{os.getpid()}.bak")
+        path.replace(backup)
+
+    def _load_json(self, path: Path, default):
+        """Load JSON, backing up and replacing corrupt files."""
+        if not path.exists():
+            return default
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            self._backup_corrupt_json(path)
+            return default
+
+    def _atomic_write(self, path: Path, data):
+        """Atomically write JSON with fsync and a same-directory temp file."""
+        fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as temp_file:
+                json.dump(data, temp_file, indent=2)
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+            os.replace(temp_name, path)
+            directory_fd = os.open(path.parent, os.O_RDONLY)
             try:
-                return json.loads(current_file.read_text())
-            except json.JSONDecodeError:
-                return None
-        return None
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except Exception:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
+            raise
+
+    def _lock(self):
+        """Return an advisory lock context manager for the data directory."""
+        from contextlib import contextmanager
+
+        @contextmanager
+        def locked():
+            with self._thread_lock:
+                nested = self._lock_depth > 0
+                lock_file = None
+                if not nested:
+                    lock_file = open(self.data_dir / ".waytimer.lock", "a+", encoding="utf-8")
+                    if fcntl is not None:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                self._lock_depth += 1
+                try:
+                    yield
+                finally:
+                    self._lock_depth -= 1
+                    if lock_file is not None:
+                        if fcntl is not None:
+                            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                        lock_file.close()
+
+        return locked()
+
+    def _load_current(self) -> Optional[dict]:
+        """Load the currently running timer under the data lock."""
+        with self._lock():
+            return self._load_json(self.data_dir / "current.json", None)
 
     def _save_current(self, activity: Optional[dict]):
-        """Save the currently running timer."""
+        """Save the currently running timer atomically under the data lock."""
         current_file = self.data_dir / "current.json"
-        if activity is None:
-            current_file.unlink(missing_ok=True)
-        else:
-            current_file.write_text(json.dumps(activity, indent=2))
+        with self._lock():
+            if activity is None:
+                current_file.unlink(missing_ok=True)
+            else:
+                self._atomic_write(current_file, activity)
 
     def _load_activities(self) -> dict:
-        """Load all activities from storage."""
-        if self.data_file.exists():
-            try:
-                return json.loads(self.data_file.read_text())
-            except json.JSONDecodeError:
-                return {}
-        return {}
+        """Load all activities under the data lock."""
+        with self._lock():
+            return self._load_json(self.data_file, {})
 
     def _save_activities(self):
-        """Save all activities to storage."""
-        self.data_file.write_text(json.dumps(self.activities, indent=2))
+        """Save all activities atomically under the data lock."""
+        with self._lock():
+            self._atomic_write(self.data_file, self.activities)
 
     def create_activity(self, name: str):
         """Create a new activity and start the timer."""
+        with self._lock():
+            self.activities = self._load_json(self.data_file, {})
+            self.current_activity = self._load_json(self.data_dir / "current.json", None)
+            return self._create_activity_locked(name)
+
+    def _create_activity_locked(self, name: str):
         if name in self.activities:
             return False
 
+        now_wall = time.time()
+        now_mono = time.monotonic()
         self.current_activity = {
             "name": name,
-            "started_at": time.time(),
+            "started_at": now_wall,
+            "started_monotonic": now_mono,
+            "elapsed_before_pause": 0.0,
             "paused_at": None,
+            "paused_monotonic": None,
         }
         self._save_current(self.current_activity)
 
@@ -85,25 +164,41 @@ class ActivityTimer:
 
     def pause_activity(self):
         """Pause the current activity."""
+        with self._lock():
+            self.current_activity = self._load_json(self.data_dir / "current.json", None)
+            return self._pause_activity_locked()
+
+    def _pause_activity_locked(self):
         if not self.current_activity:
             return False
 
-        if self.current_activity.get("paused_at"):
-            # Resume
-            pause_duration = time.time() - self.current_activity["paused_at"]
-            self.current_activity["started_at"] += pause_duration
+        if self.current_activity.get("paused_at") is not None:
+            # Resume: accumulate only active monotonic time.
+            pause_mono = self.current_activity.get("paused_monotonic")
+            started_mono = self.current_activity.get("started_monotonic")
+            accumulated = self.current_activity.get("elapsed_before_pause", 0.0)
+            if pause_mono is not None and started_mono is not None:
+                accumulated += max(0.0, pause_mono - started_mono)
+            self.current_activity["elapsed_before_pause"] = accumulated
+            self.current_activity["started_monotonic"] = time.monotonic()
             self.current_activity["paused_at"] = None
-            msg = "Timer resumed"
+            self.current_activity["paused_monotonic"] = None
         else:
             # Pause
             self.current_activity["paused_at"] = time.time()
-            msg = "Timer paused"
+            self.current_activity["paused_monotonic"] = time.monotonic()
 
         self._save_current(self.current_activity)
         return True
 
     def stop_activity(self):
         """Stop the current activity and save the time."""
+        with self._lock():
+            self.current_activity = self._load_json(self.data_dir / "current.json", None)
+            self.activities = self._load_json(self.data_file, {})
+            return self._stop_activity_locked()
+
+    def _stop_activity_locked(self):
         if not self.current_activity:
             return False
 
@@ -129,11 +224,22 @@ class ActivityTimer:
         return True
 
     def _get_elapsed_time(self, activity: dict) -> float:
-        """Calculate elapsed time for an activity."""
+        """Calculate active elapsed time using monotonic time when available."""
+        accumulated = activity.get("elapsed_before_pause", 0.0)
+        started_mono = activity.get("started_monotonic")
+
+        if started_mono is not None:
+            if activity.get("paused_at") is not None:
+                paused_mono = activity.get("paused_monotonic")
+                end_mono = paused_mono if paused_mono is not None else time.monotonic()
+            else:
+                end_mono = time.monotonic()
+            return max(0.0, accumulated + max(0.0, end_mono - started_mono))
+
+        # Compatibility for state files created before monotonic tracking.
         start = activity["started_at"]
-        # Use paused_at if set, otherwise use current time
         end = activity.get("paused_at") or time.time()
-        return end - start
+        return max(0.0, end - start)
 
     def _format_time(self, seconds: float) -> str:
         """Format seconds to HH:MM:SS."""
@@ -181,6 +287,12 @@ class ActivityTimer:
 
     def resume_activity(self, name: str) -> bool:
         """Resume a previously stopped activity."""
+        with self._lock():
+            self.activities = self._load_json(self.data_file, {})
+            self.current_activity = self._load_json(self.data_dir / "current.json", None)
+            return self._resume_activity_locked(name)
+
+    def _resume_activity_locked(self, name: str) -> bool:
         if name not in self.activities:
             return False
 
@@ -188,16 +300,26 @@ class ActivityTimer:
             return False
 
         # Start a new session for this activity
+        now_wall = time.time()
+        now_mono = time.monotonic()
         self.current_activity = {
             "name": name,
-            "started_at": time.time(),
+            "started_at": now_wall,
+            "started_monotonic": now_mono,
+            "elapsed_before_pause": 0.0,
             "paused_at": None,
+            "paused_monotonic": None,
         }
         self._save_current(self.current_activity)
         return True
 
     def delete_activity(self, name: str) -> bool:
         """Delete an activity and its history."""
+        with self._lock():
+            self.activities = self._load_json(self.data_file, {})
+            return self._delete_activity_locked(name)
+
+    def _delete_activity_locked(self, name: str) -> bool:
         if name not in self.activities:
             return False
 

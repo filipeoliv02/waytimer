@@ -8,3 +8,4 @@ pkg/
 *.tar.zst
 __pycache__/
 *.pyc
+.venv/
